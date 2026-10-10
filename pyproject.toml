@@ -4,20 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaist-login"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local KAIST SSO broker with OS-backed secrets and a bounded MCP interface"
 requires-python = ">=3.11"
 dependencies = [
   "keyring>=25,<26", "playwright>=1.51,<2", "cryptography>=44",
   "platformdirs>=4,<5", "filelock>=3,<4", "mcp>=1.12,<2",
-  "google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3",
 ]
 
 [project.scripts]
 kaist-login = "kaist_login.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.25", "build>=1"]
+oauth = ["google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
+dev = ["pytest>=8", "pytest-asyncio>=0.25", "build>=1", "google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
 
 [tool.setuptools.packages.find]
 include = ["kaist_login*"]

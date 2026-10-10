@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlsplit
@@ -32,8 +33,6 @@ def setup():
     def save():
         try:
             email = entries["external_email"].get().strip()
-            if email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-                raise BrokerError("invalid_email")
             store.save_account(entries["username"].get(), entries["password"].get(), email)
             entries["password"].delete(0, "end")
             messagebox.showinfo("저장 완료", "계정을 저장했습니다. Gmail 연결은 gmail-connect 명령으로 진행하세요.", parent=root)
@@ -53,10 +52,88 @@ def select_client_file():
     return path
 
 
+def mail_options(store=None):
+    store = store or Store()
+    root = tk.Tk()
+    root.title("KAIST Login — 인증메일 옵션")
+    frame = ttk.Frame(root, padding=24)
+    frame.pack(fill="both", expand=True)
+    enabled = tk.BooleanVar(value=store.config().get("delete_otp_email", False))
+    ttk.Checkbutton(frame, text="로그인 성공 후 사용한 인증메일 한 통을 휴지통으로 이동", variable=enabled).pack(anchor="w")
+    ttk.Label(frame, text="기본값은 꺼짐입니다. 인증에 실패한 메일은 보존합니다.").pack(anchor="w", pady=12)
+    def save():
+        store.set_mail_cleanup(enabled.get())
+        root.destroy()
+    ttk.Button(frame, text="옵션 저장", command=save).pack(anchor="e")
+    root.mainloop()
+
+
+def gmail_imap_setup(delete_otp_email=None):
+    from .gmail_imap import check_connection
+    store = Store()
+    root = tk.Tk()
+    root.title("KAIST Login — Gmail 앱 비밀번호 연결")
+    root.geometry("650x420")
+    frame = ttk.Frame(root, padding=24)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="Google Cloud 없이 Gmail 연결", font=("", 16)).pack(anchor="w")
+    ttk.Label(frame, text="Google 계정의 2단계 인증을 켠 뒤 앱 비밀번호를 한 번 만드세요.\n일반 Google 비밀번호가 아닌, 별도로 발급한 16자리 앱 비밀번호를 입력하세요.", wraplength=600).pack(anchor="w", pady=12)
+    ttk.Label(frame, text="외부 Gmail 주소").pack(anchor="w")
+    email = ttk.Entry(frame, width=70)
+    email.insert(0, store.config().get("external_email", ""))
+    email.pack(fill="x", pady=(2, 12))
+    ttk.Label(frame, text="Google 앱 비밀번호 (공백을 포함해 붙여넣어도 됩니다)").pack(anchor="w")
+    password = ttk.Entry(frame, show="•", width=70)
+    password.pack(fill="x", pady=(2, 12))
+    enabled = tk.BooleanVar(value=store.config().get("delete_otp_email", False) if delete_otp_email is None else delete_otp_email)
+    ttk.Checkbutton(frame, text="로그인 성공 후 사용한 인증메일을 휴지통으로 이동", variable=enabled).pack(anchor="w")
+    notice = tk.StringVar(value="앱 비밀번호는 이 기기의 OS 보안 저장소에 보관합니다.")
+    ttk.Label(frame, textvariable=notice, wraplength=600).pack(anchor="w", pady=14)
+    pool = ThreadPoolExecutor(max_workers=1)
+    alive = True
+    def close():
+        nonlocal alive
+        alive = False
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", close)
+
+    def save():
+        address, secret = email.get().strip(), "".join(password.get().split())
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) or not re.fullmatch(r"[A-Za-z0-9]{16}", secret):
+            notice.set("Gmail 주소와 Google이 발급한 16자리 앱 비밀번호를 확인하세요.")
+            return
+        button.configure(state="disabled")
+        notice.set("Gmail 연결 확인 중…")
+        future = pool.submit(check_connection, address, secret)
+        def finished():
+            if not alive:
+                return
+            if not future.done():
+                root.after(100, finished)
+                return
+            try:
+                future.result()
+                store.save_imap(address, secret, enabled.get())
+                password.delete(0, "end")
+                messagebox.showinfo("연결 완료", "Gmail 앱 비밀번호를 저장했습니다. 주기적인 OAuth 재승인은 필요 없습니다.", parent=root)
+                close()
+            except Exception as exc:
+                code = exc.code if isinstance(exc, BrokerError) else "operation_failed"
+                notice.set(f"연결 실패 ({code}). 앱 비밀번호와 계정의 IMAP 사용 가능 여부를 확인하세요.")
+                button.configure(state="normal")
+        root.after(100, finished)
+    button = ttk.Button(frame, text="연결 확인 후 보안 저장소에 저장", command=save)
+    button.pack(anchor="e")
+    try:
+        root.mainloop()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def confirm_forget():
     root = tk.Tk()
     root.withdraw()
-    answer = messagebox.askyesno("로컬 연결 삭제", "저장한 KAIST 비밀번호, Gmail 토큰, 로그인 세션을 이 기기에서 삭제할까요?\nGoogle 계정의 앱 권한은 별도로 취소해야 합니다.", parent=root)
+    answer = messagebox.askyesno("로컬 연결 삭제", "저장한 KAIST 비밀번호, Gmail 앱 비밀번호·토큰, 로그인 세션을 이 기기에서 삭제할까요?\nGoogle 계정의 앱 비밀번호·권한은 별도로 취소해야 합니다.", parent=root)
     root.destroy()
     return answer
 

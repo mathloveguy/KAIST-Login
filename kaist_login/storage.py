@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -101,17 +102,47 @@ class Store:
     def save_account(self, username: str, password: str, email: str):
         if not username.strip() or not password:
             raise BrokerError("account_fields_required")
+        if email.strip() and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email.strip()):
+            raise BrokerError("invalid_email")
         old = self.config()
         self.set_secret("sso-password", password)
         self.forget_session()
         # Changing identities must not reuse the old mailbox authorization.
         if old.get("external_email") != email.strip():
             (self.root / "gmail.sealed").unlink(missing_ok=True)
+            self.delete_secret("gmail-imap-password")
         retained = old if old.get("username") == username.strip() else {}
         if old.get("external_email") != email.strip():
             retained.pop("mfa", None)
+            retained.pop("gmail_backend", None)
+            retained.pop("gmail_imap_connected", None)
+        elif old.get("username") != username.strip():
+            for key in ("gmail_backend", "gmail_imap_connected", "delete_otp_email"):
+                if key in old:
+                    retained[key] = old[key]
         retained.update(username=username.strip(), external_email=email.strip(), login_blocked=False)
         self.save_config(retained)
+
+    def save_imap(self, email: str, app_password: str, delete_otp_email: bool = False):
+        password = "".join(app_password.split())
+        if not re.fullmatch(r"[A-Za-z0-9]{16}", password):
+            raise BrokerError("gmail_app_password_required")
+        email = email.strip()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise BrokerError("invalid_email")
+        config = self.config()
+        if config.get("external_email", "").lower() != email.lower():
+            config.pop("mfa", None)
+        self.set_secret("gmail-imap-password", password)
+        (self.root / "gmail.sealed").unlink(missing_ok=True)
+        config.update(external_email=email, gmail_backend="imap", gmail_imap_connected=True,
+                      delete_otp_email=bool(delete_otp_email))
+        self.save_config(config)
+
+    def set_mail_cleanup(self, enabled: bool):
+        config = self.config()
+        config["delete_otp_email"] = enabled
+        self.save_config(config)
 
     def status(self) -> dict:
         config = self.config()
@@ -119,10 +150,15 @@ class Store:
                 "external_email": config.get("external_email"),
                 "configured": bool(config.get("username")),
                 "session_saved": (self.root / "session.sealed").exists(),
-                "gmail_connected": (self.root / "gmail.sealed").exists()}
+                "gmail_connected": (config.get("gmail_imap_connected", False)
+                                    if config.get("gmail_backend") == "imap"
+                                    else (self.root / "gmail.sealed").exists()),
+                "gmail_backend": config.get("gmail_backend", "oauth" if (self.root / "gmail.sealed").exists() else None),
+                "delete_otp_email": config.get("delete_otp_email", False)}
 
     def forget_all(self):
         for name in ("session.sealed", "gmail.sealed", "config.json"):
             (self.root / name).unlink(missing_ok=True)
         self.delete_secret("sso-password")
+        self.delete_secret("gmail-imap-password")
         self.delete_secret("encryption-key")

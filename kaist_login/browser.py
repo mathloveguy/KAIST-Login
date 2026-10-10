@@ -9,12 +9,20 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from filelock import FileLock, Timeout
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from .errors import BrokerError, safe_errors
 from .gmail import GmailOTP
 from .policy import NAV_HOSTS, SITES, SSO_HOST, auth_url, host, safe_location, service_url
 from .storage import Store
+
+
+def mailbox_client(store):
+    backend = store.config().get("gmail_backend")
+    if backend == "oauth" or (backend is None and (store.root / "gmail.sealed").exists()):
+        return GmailOTP(store)
+    from .gmail_imap import IMAPGmailOTP
+    return IMAPGmailOTP(store)
 
 
 @dataclass(repr=False)
@@ -101,14 +109,14 @@ async def click_unique(page, selector):
     await locator.click()
 
 
-async def run_mfa(page, store, started: float, deadline: float, redactions: list[str]):
+async def run_mfa(page, store, started: float, deadline: float, redactions: list[str], client=None):
     rule = store.config().get("mfa")
     if not rule or host(page.url) != SSO_HOST:
         return False
     # The rule is learned locally, not supplied by an LLM or a webpage.
     if urlsplit(page.url).path != rule["path"]:
         return False
-    client = await asyncio.to_thread(GmailOTP, store)
+    client = client or await asyncio.to_thread(mailbox_client, store)
     if rule.get("choose_email"):
         await click_unique(page, rule["choose_email"])
     if rule.get("send"):
@@ -181,7 +189,12 @@ async def authenticate(page, context, store, site, *, manual=False, timeout=150)
     await reach_sso(page, site, store)
     deadline = time.monotonic() + timeout
     started = time.time()
+    client = None
     if not await is_ready(page, site, store) and not manual:
+        if store.config().get("mfa"):
+            # Fail on an expired/revoked Gmail token before the one-shot password
+            # submission, so a mailbox problem does not leave login_blocked set.
+            client = await asyncio.to_thread(mailbox_client, store)
         await submit_password(page, store, redactions)
     mfa_done = False
     while time.monotonic() < deadline:
@@ -192,16 +205,17 @@ async def authenticate(page, context, store, site, *, manual=False, timeout=150)
             store.save_config(config)
             cleanup = "not_used"
             if isinstance(mfa_done, PendingOTP):
-                try:
-                    await asyncio.to_thread(mfa_done.client.trash_used, mfa_done.message_id)
-                    cleanup = "trashed"
-                except Exception:
-                    # Authentication succeeded; report cleanup separately and never
-                    # trigger a second login/code submission just to retry deletion.
-                    cleanup = "failed"
+                cleanup = "kept"
+                if store.config().get("delete_otp_email", False):
+                    try:
+                        await asyncio.to_thread(mfa_done.client.trash_used, mfa_done.message_id)
+                        cleanup = "trashed"
+                    except Exception:
+                        # Authentication succeeded; never repeat it to retry cleanup.
+                        cleanup = "failed"
             return AuthResult(redactions, cleanup)
         if not manual and not mfa_done:
-            mfa_done = await run_mfa(page, store, started, deadline, redactions)
+            mfa_done = await run_mfa(page, store, started, deadline, redactions, client)
         # The user can complete MFA/CAPTCHA locally in the visible browser.
         await asyncio.sleep(0.5)
     raise BrokerError("needs_user_login_or_success_marker")
@@ -267,6 +281,11 @@ class Broker:
             if password:
                 secrets.append(password)
             await page.goto(target, wait_until="domcontentloaded")
+            try:
+                # SPA pages such as Dooray render after XHR; allow a bounded settle time.
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
             result = await read_content(page, secrets, limit)
             result["otp_cleanup"] = auth.otp_cleanup
             await save_session(context, self.store)

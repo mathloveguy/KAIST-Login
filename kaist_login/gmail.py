@@ -2,15 +2,29 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import json
 import re
 import time
+from email.message import Message
 from email.utils import getaddresses, parseaddr
+from pathlib import Path
 from html.parser import HTMLParser
 
 from .errors import BrokerError
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+READ_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+
+def requested_scopes(store, delete_otp_email=None):
+    enabled = store.config().get("delete_otp_email", False) if delete_otp_email is None else delete_otp_email
+    return SCOPES if enabled else READ_SCOPES
+
+
+def scopes_sufficient(saved, scopes):
+    granted = set(saved.get("scopes", []))
+    return set(scopes).issubset(granted) or (scopes == READ_SCOPES and set(SCOPES).issubset(granted))
 
 
 class PlainText(HTMLParser):
@@ -32,6 +46,21 @@ class PlainText(HTMLParser):
             self.parts.append(data)
 
 
+def part_charset(payload: dict) -> str:
+    # Gmail returns part bytes in their declared charset; Korean mail is often EUC-KR.
+    header = Message()
+    for item in payload.get("headers", []):
+        if item.get("name", "").lower() == "content-type":
+            header["Content-Type"] = item.get("value", "")
+    charset = header.get_content_charset() or "utf-8"
+    try:
+        name = codecs.lookup(charset).name
+    except LookupError:
+        return "utf-8"
+    # CP949 is a superset of EUC-KR and is what Korean senders actually emit.
+    return "cp949" if name == "euc_kr" else name
+
+
 def body_text(payload: dict) -> str:
     pieces = []
     # Do not download attachments or traverse embedded attached emails.
@@ -39,7 +68,7 @@ def body_text(payload: dict) -> str:
         return ""
     if payload.get("mimeType") in {"text/plain", "text/html"}:
         raw = payload.get("body", {}).get("data", "")
-        decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
+        decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode(part_charset(payload), "replace")
         if payload.get("mimeType") == "text/html":
             parser = PlainText()
             parser.feed(decoded)
@@ -82,56 +111,76 @@ def extract_code(message: dict, *, sender: str, recipient: str,
         return None
     text = body_text(payload)
     # Anchor to the code label and reject ambiguity; never use an arbitrary number.
-    codes = set(re.findall(r"(?:인증\s*(?:번호|코드)|verification\s*code|one[- ]time\s*(?:password|code)|OTP)\s*[:：\-]?\s*([0-9]{6})(?![0-9])", text, re.I))
+    # A short digit-free gap allows "인증번호는 [123456]" style phrasing.
+    codes = set(re.findall(r"(?:인증\s*(?:번호|코드)|verification\s*code|one[- ]time\s*(?:password|code)|OTP)[^0-9\n]{0,12}?([0-9]{6})(?![0-9])", text, re.I))
     return next(iter(codes)) if len(codes) == 1 else None
 
 
-def connect(store, client_file: str):
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
+def connect(store, client_file: str, delete_otp_email=None):
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError:
+        raise BrokerError("oauth_dependencies_required") from None
 
     email = store.config().get("external_email", "")
     if not email:
         raise BrokerError("external_email_required")
-    config = json.loads(open(client_file, encoding="utf-8").read())
+    config = json.loads(Path(client_file).read_text("utf-8"))
     installed = config.get("installed", {})
     if (installed.get("auth_uri") != "https://accounts.google.com/o/oauth2/auth"
             or installed.get("token_uri") != "https://oauth2.googleapis.com/token"):
         raise BrokerError("official_google_desktop_client_required")
-    flow = InstalledAppFlow.from_client_config(config, SCOPES, autogenerate_code_verifier=True)
+    scopes = requested_scopes(store, delete_otp_email)
+    flow = InstalledAppFlow.from_client_config(config, scopes, autogenerate_code_verifier=True)
     credentials = flow.run_local_server(
         host="127.0.0.1", port=0, open_browser=True, timeout_seconds=180,
         authorization_prompt_message="", success_message="Gmail 연결 확인 중입니다. 이 창을 닫아도 됩니다.",
         access_type="offline", prompt="consent", login_hint=email,
     )
     granted = credentials.granted_scopes or credentials.scopes or []
-    if not set(SCOPES).issubset(granted):
-        raise BrokerError("gmail_modify_consent_required")
+    if not scopes_sufficient({"scopes": granted}, scopes):
+        raise BrokerError("gmail_reconnect_required")
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
     profile = service.users().getProfile(userId="me").execute()
     if profile["emailAddress"].lower() != email.lower():
         raise BrokerError("gmail_account_mismatch")
     store.seal("gmail", json.loads(credentials.to_json()))
+    config = store.config()
+    config.update(gmail_backend="oauth", gmail_imap_connected=False)
+    if delete_otp_email is not None:
+        config["delete_otp_email"] = delete_otp_email
+    store.save_config(config)
+    store.delete_secret("gmail-imap-password")
 
 
 class GmailOTP:
     def __init__(self, store):
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
+        try:
+            from google.oauth2.credentials import Credentials
+            from google.auth.exceptions import RefreshError
+            from google.auth.transport.requests import Request
+            from googleapiclient.discovery import build
+        except ImportError:
+            raise BrokerError("oauth_dependencies_required") from None
         self.store = store
         saved = store.unseal("gmail")
         if not saved:
             raise BrokerError("gmail_not_connected")
         # Do not relabel an old readonly token with broader requested scopes.
-        if not set(SCOPES).issubset(saved.get("scopes", [])):
+        scopes = requested_scopes(store)
+        if not scopes_sufficient(saved, scopes):
             raise BrokerError("gmail_reconnect_required")
         # Pin the destination even if stored data was generated by an older release.
         if saved.get("token_uri") != "https://oauth2.googleapis.com/token":
             raise BrokerError("invalid_oauth_destination")
-        credentials = Credentials.from_authorized_user_info(saved, SCOPES)
+        credentials = Credentials.from_authorized_user_info(saved, saved.get("scopes", scopes))
         if credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
+            try:
+                credentials.refresh(Request())
+            except RefreshError:
+                # Revoked, or expired after 7 days in an OAuth app left in "Testing".
+                raise BrokerError("gmail_reconnect_required") from None
             store.seal("gmail", json.loads(credentials.to_json()))
         self.service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
         self._candidate_ids = set()

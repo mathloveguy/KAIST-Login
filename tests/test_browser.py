@@ -98,7 +98,7 @@ async def test_otp_stays_internal_and_ambiguity_stops_submission(browser_page, s
             pass
         def candidates(self, since, rule):
             return [("one", "123456"), ("two", "654321")] if ambiguous else [("one", "123456")]
-    monkeypatch.setattr(module, "GmailOTP", Mailbox)
+    monkeypatch.setattr(module, "mailbox_client", Mailbox)
     redactions = []
     if ambiguous:
         with pytest.raises(BrokerError, match="ambiguous_otp"):

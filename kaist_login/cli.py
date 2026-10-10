@@ -14,7 +14,11 @@ def parser():
     setup = commands.add_parser("setup", help="로컬 비밀번호 입력창 열기")
     setup.add_argument("--terminal", action="store_true", help="사용자 터미널에서만 getpass 사용")
     commands.add_parser("status", help="아이디와 연결 상태만 출력")
-    commands.add_parser("gmail-connect", help="파일 선택창과 Google OAuth로 Gmail 연결")
+    gmail = commands.add_parser("gmail-connect", help="Gmail 앱 비밀번호를 로컬 입력창에서 등록")
+    gmail.add_argument("--method", choices=["imap", "oauth"], default="imap")
+    gmail.add_argument("--delete-otp-email", action=argparse.BooleanOptionalAction, default=None)
+    options = commands.add_parser("mail-options", help="인증메일 자동 삭제 설정 (기본 꺼짐)")
+    options.add_argument("--delete-otp-email", action=argparse.BooleanOptionalAction, default=None)
     for name in ("login", "calibrate"):
         command = commands.add_parser(name)
         command.add_argument("site", choices=["klms", "dooray"])
@@ -64,13 +68,25 @@ def perform(args):
     if args.command == "status":
         return Store().status()
     if args.command == "gmail-connect":
+        if args.method == "imap":
+            from .ui import gmail_imap_setup
+            gmail_imap_setup(delete_otp_email=args.delete_otp_email)
+            return {"status": "gmail_setup_closed"}
         from .gmail import connect
         from .ui import select_client_file
         path = select_client_file()
         if not path:
             return {"status": "cancelled"}
-        connect(Store(), path)
+        connect(Store(), path, args.delete_otp_email)
         return {"status": "gmail_connected"}
+    if args.command == "mail-options":
+        store = Store()
+        if args.delete_otp_email is None:
+            from .ui import mail_options
+            mail_options(store)
+        else:
+            store.set_mail_cleanup(args.delete_otp_email)
+        return {"status": "ok", "delete_otp_email": store.config().get("delete_otp_email", False)}
     if args.command == "calibrate":
         from .ui import calibrate
         asyncio.run(calibrate(args.site))
